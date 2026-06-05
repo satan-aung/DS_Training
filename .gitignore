@@ -1,0 +1,33 @@
+# Python cache and artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.Python
+
+# Virtual environments
+venv/
+.env/
+.venv/
+ENV/
+env/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# IDE files
+.vscode/
+.idea/
+
+# Output directories
+output/
+Output_Folder/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
