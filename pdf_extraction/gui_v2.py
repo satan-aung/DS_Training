@@ -14,9 +14,10 @@ Features
 • Skip first / last N rows per page
 • Table detection strategy selector (auto / lines / text)
 • Threaded extraction with live progress bar and colour-coded log
-• Export clean data as  Excel / CSV / JSON
+• Export clean data as Excel / CSV / JSON
 • Export removed rows always as Excel (with source file, page, reason)
 • Save / load configuration as JSON for reuse
+• FULLY RESIZABLE: Adjust window size and drag middle divider
 """
 
 from __future__ import annotations
@@ -32,7 +33,7 @@ import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-from pdf_extractor import ColumnDef, ExtractionConfig, PDFExtractor
+from pdf_extraction.pdf_extractor import ColumnDef, ExtractionConfig, PDFExtractor
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -40,7 +41,29 @@ from pdf_extractor import ColumnDef, ExtractionConfig, PDFExtractor
 # ══════════════════════════════════════════════════════════════════════════════
 
 APP_TITLE   = "PDF Data Extractor"
-APP_VERSION = "1.0"
+APP_VERSION = "2.0"  # Updated for resizable layout
+
+PRESET_REGEX_PATTERNS = {
+    "PII Complete (5 cols)": (
+        r'^(?P<name>.+?)\s{2,}'
+        r'(?P<ssn>\d{3}-\d{2}-\d{4})\s{2,}'
+        r'(?P<dob>\d{4}-\d{2}-\d{2})\s{2,}'
+        r'(?P<phone>\(\d{3}\)\s\d{3}-\d{4})\s{2,}'
+        r'(?P<email>\S+@\S+)$'
+    ),
+    "PII strict": (
+        r"^(?P<name>.+?)\s{2,}"
+        r"(?P<ssn>\d{3}-\d{2}-\d{4})\s{2,}"
+        r"(?P<dob>\d{4}-\d{2}-\d{2})\s{2,}"
+        r"(?P<phone>\(\d{3}\)\s\d{3}-\d{4})\s{2,}"
+        r"(?P<email>\S+@\S+)$"
+    ),
+    "Email": r"^\S+@\S+\.\S+$",
+    "Phone": r"^\(\d{3}\)\s\d{3}-\d{4}$",
+}
+
+# PII Column names for the complete pattern
+PII_COLUMN_NAMES = ["name", "ssn", "dob", "phone", "email"]
 
 # Pre-filled skip patterns (regex, one per line)
 DEFAULT_SKIP = (
@@ -75,17 +98,23 @@ class ColumnRow(ttk.Frame):
         super().__init__(parent, **kw)
         self.index = index
 
-        ttk.Label(self, text=str(index), width=3, anchor="center").pack(
-            side=tk.LEFT, padx=(2, 4)
+        # Use grid for better resizing within the row
+        self.columnconfigure(0, weight=0)  # index label
+        self.columnconfigure(1, weight=1)  # column name
+        self.columnconfigure(2, weight=3)  # regex pattern
+
+        ttk.Label(self, text=str(index), width=4, anchor="center").grid(
+            row=0, column=0, padx=(2, 4), sticky="w"
         )
+        
         self.name_var    = tk.StringVar(value=f"Column{index}")
         self.pattern_var = tk.StringVar()
-        ttk.Entry(self, textvariable=self.name_var,    width=18).pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Entry(self, textvariable=self.pattern_var, width=36).pack(
-            side=tk.LEFT, padx=2, fill=tk.X, expand=True
-        )
+        
+        name_entry = ttk.Entry(self, textvariable=self.name_var, width=15)
+        name_entry.grid(row=0, column=1, padx=2, sticky="ew")
+        
+        pattern_entry = ttk.Entry(self, textvariable=self.pattern_var)
+        pattern_entry.grid(row=0, column=2, padx=2, sticky="ew")
 
     @property
     def name(self) -> str:
@@ -105,8 +134,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{APP_TITLE}  v{APP_VERSION}")
-        self.geometry("1300x900")
-        self.minsize(960, 700)
+        self.geometry("1400x900")  # Slightly wider default
+        self.minsize(1024, 768)    # Larger minimum size for usability
 
         # ── Runtime state ──────────────────────────────────────────────────
         self.selected_paths: List[str]         = []
@@ -118,6 +147,9 @@ class App(tk.Tk):
         self._build_styles()
         self._build_menu()
         self._build_ui()
+
+        # Bind resize event to adjust scrollable regions
+        self.bind("<Configure>", self._on_window_resize)
 
     # ── Styles ───────────────────────────────────────────────────────────────
 
@@ -136,6 +168,9 @@ class App(tk.Tk):
         )
         s.configure("Action.TButton", font=("Segoe UI", 9), padding=4)
         s.configure("TLabelframe.Label", font=("Segoe UI", 9, "bold"))
+        
+        # Configure pane sash (divider) for better visibility
+        s.configure("TSash", background="#cccccc", gripcount=10)
 
     # ── Menu bar ─────────────────────────────────────────────────────────────
 
@@ -153,113 +188,173 @@ class App(tk.Tk):
         bar.add_cascade(label="Help", menu=hm)
         self.config(menu=bar)
 
-    # ── Top-level layout ─────────────────────────────────────────────────────
+    # ── Top-level layout (FULLY RESIZABLE) ─────────────────────────────────────
 
     def _build_ui(self) -> None:
-        pane = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        pane.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        # Main vertical container that fills the window
+        main_container = ttk.Frame(self)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
-        left  = ttk.Frame(pane)
-        right = ttk.Frame(pane)
-        pane.add(left,  weight=2)
-        pane.add(right, weight=3)
+        # Horizontal PanedWindow for left/right panels (ADJUSTABLE DIVIDER)
+        self.main_pane = ttk.PanedWindow(main_container, orient=tk.HORIZONTAL)
+        self.main_pane.pack(fill=tk.BOTH, expand=True)
 
-        self._build_left(left)
-        self._build_right(right)
+        # Left panel (configuration) - weight 40% initially
+        left_frame = ttk.Frame(self.main_pane)
+        self.main_pane.add(left_frame, weight=40)
+
+        # Right panel (results) - weight 60% initially
+        right_frame = ttk.Frame(self.main_pane)
+        self.main_pane.add(right_frame, weight=60)
+
+        # Build both panels
+        self._build_left(left_frame)
+        self._build_right(right_frame)
+
+    def _on_window_resize(self, event=None) -> None:
+        """Handle window resize events to update scrollable regions."""
+        if hasattr(self, '_col_canvas'):
+            # Update canvas scroll region
+            self._col_canvas.configure(
+                scrollregion=self._col_canvas.bbox("all")
+            )
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  LEFT PANEL — configuration
+    #  LEFT PANEL — configuration (RESIZABLE)
     # ══════════════════════════════════════════════════════════════════════════
 
     def _build_left(self, parent: tk.Widget) -> None:
+        # Make parent expandable
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=0)  # Source
+        parent.rowconfigure(1, weight=1)  # Columns (expandable)
+        parent.rowconfigure(2, weight=0)  # Skip patterns
+        parent.rowconfigure(3, weight=0)  # Settings
+        parent.rowconfigure(4, weight=0)  # Run button
 
         # ── 1 · Source ───────────────────────────────────────────────────────
         src_frame = ttk.LabelFrame(parent, text="1 · Source")
-        src_frame.pack(fill=tk.X, padx=4, pady=4)
+        src_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        src_frame.columnconfigure(0, weight=1)
 
         btn_row = ttk.Frame(src_frame)
-        btn_row.pack(fill=tk.X, padx=6, pady=(6, 2))
+        btn_row.grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        btn_row.columnconfigure(0, weight=0)
+        btn_row.columnconfigure(1, weight=0)
+        btn_row.columnconfigure(2, weight=1)
+        
         ttk.Button(
             btn_row, text="📄  Select PDF File(s)…",
-            command=self._pick_files, style="Action.TButton", width=22,
-        ).pack(side=tk.LEFT, padx=(0, 6))
+            command=self._pick_files, style="Action.TButton",
+        ).grid(row=0, column=0, padx=(0, 6), sticky="w")
+        
         ttk.Button(
             btn_row, text="📁  Select Folder…",
-            command=self._pick_folder, style="Action.TButton", width=16,
-        ).pack(side=tk.LEFT)
+            command=self._pick_folder, style="Action.TButton",
+        ).grid(row=0, column=1, sticky="w")
 
         self._src_lbl = ttk.Label(
-            src_frame, text="No source selected.", foreground="#888", wraplength=440
+            src_frame, text="No source selected.", foreground="#888"
         )
-        self._src_lbl.pack(padx=6, pady=(2, 6), anchor="w")
+        self._src_lbl.grid(row=1, column=0, sticky="w", padx=6, pady=(2, 6))
 
-        # ── 2 · Column configuration ─────────────────────────────────────────
+        # ── 2 · Column configuration (EXPANDABLE) ─────────────────────────────
         col_lf = ttk.LabelFrame(parent, text="2 · Column Configuration")
-        col_lf.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        col_lf.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        col_lf.columnconfigure(0, weight=1)
+        col_lf.rowconfigure(3, weight=1)  # Scrollable area expands
 
+        # Number of columns row
         n_row = ttk.Frame(col_lf)
-        n_row.pack(fill=tk.X, padx=6, pady=4)
-        ttk.Label(n_row, text="Number of columns:").pack(side=tk.LEFT)
-        self._ncols = tk.IntVar(value=3)
+        n_row.grid(row=0, column=0, sticky="ew", padx=6, pady=4)
+        n_row.columnconfigure(0, weight=0)
+        n_row.columnconfigure(1, weight=1)
+        
+        ttk.Label(n_row, text="Number of columns:").grid(row=0, column=0, sticky="w")
+        self._ncols = tk.IntVar(value=5)  # Default to 5 for PII pattern
         spin = ttk.Spinbox(
             n_row, from_=1, to=30, textvariable=self._ncols,
             width=5, command=self._refresh_cols,
         )
-        spin.pack(side=tk.LEFT, padx=6)
+        spin.grid(row=0, column=1, sticky="w", padx=6)
         spin.bind("<Return>",   lambda _: self._refresh_cols())
         spin.bind("<FocusOut>", lambda _: self._refresh_cols())
 
         # Table header row
         hdr = ttk.Frame(col_lf)
-        hdr.pack(fill=tk.X, padx=6, pady=(0, 1))
-        ttk.Label(hdr, text="#",           width=3,  anchor="center").pack(side=tk.LEFT, padx=(2, 4))
-        ttk.Label(hdr, text="Column Name", width=18, anchor="w").pack(side=tk.LEFT, padx=2)
-        ttk.Label(hdr, text="Regex Pattern  (empty = accept all values)", anchor="w").pack(
-            side=tk.LEFT, padx=2
-        )
-        ttk.Separator(col_lf, orient="horizontal").pack(fill=tk.X, padx=6, pady=1)
+        hdr.grid(row=1, column=0, sticky="ew", padx=6, pady=(0, 1))
+        hdr.columnconfigure(0, weight=0)  # #
+        hdr.columnconfigure(1, weight=1)  # Column Name
+        hdr.columnconfigure(2, weight=3)  # Regex Pattern
+        
+        ttk.Label(hdr, text="#", width=4, anchor="center").grid(row=0, column=0, sticky="w")
+        ttk.Label(hdr, text="Column Name", anchor="w").grid(row=0, column=1, sticky="ew", padx=2)
+        ttk.Label(
+            hdr, text="Regex Pattern (empty = accept all values)", anchor="w"
+        ).grid(row=0, column=2, sticky="ew", padx=2)
 
-        # Scrollable ColumnRow list
+        # Preset patterns row
+        preset_row = ttk.Frame(col_lf)
+        preset_row.grid(row=2, column=0, sticky="ew", padx=6, pady=(2, 4))
+        preset_row.columnconfigure(0, weight=0)
+        for i, label in enumerate(("PII Complete (5 cols)", "PII strict", "Email", "Phone")):
+            ttk.Button(
+                preset_row,
+                text=label,
+                command=lambda lbl=label: self._insert_preset_pattern(lbl),
+                style="Action.TButton",
+            ).grid(row=0, column=i, padx=(0 if i == 0 else 6, 0), sticky="w")
+
+        ttk.Separator(col_lf, orient="horizontal").grid(row=3, column=0, sticky="ew", padx=6, pady=1)
+
+        # Scrollable ColumnRow list (EXPANDS)
         wrap = ttk.Frame(col_lf)
-        wrap.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 4))
+        wrap.grid(row=4, column=0, sticky="nsew", padx=6, pady=(0, 4))
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+        
         self._col_canvas = tk.Canvas(wrap, highlightthickness=0)
         vsb = ttk.Scrollbar(wrap, orient="vertical", command=self._col_canvas.yview)
         self._col_canvas.configure(yscrollcommand=vsb.set)
-        self._col_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self._col_canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
 
         self._col_inner = ttk.Frame(self._col_canvas)
         self._col_win   = self._col_canvas.create_window(
             (0, 0), window=self._col_inner, anchor="nw"
         )
-        self._col_inner.bind(
-            "<Configure>",
-            lambda e: self._col_canvas.configure(
-                scrollregion=self._col_canvas.bbox("all")
-            ),
-        )
+        
+        # Configure inner frame columns to expand
+        self._col_inner.columnconfigure(0, weight=1)
+        
+        def _configure_scrollregion(event):
+            self._col_canvas.configure(scrollregion=self._col_canvas.bbox("all"))
+        
+        self._col_inner.bind("<Configure>", _configure_scrollregion)
         self._col_canvas.bind(
             "<Configure>",
             lambda e: self._col_canvas.itemconfig(self._col_win, width=e.width),
         )
-        # Mousewheel scrolling
-        self._col_canvas.bind_all(
-            "<MouseWheel>",
-            lambda e: self._col_canvas.yview_scroll(int(-1 * e.delta / 120), "units"),
-        )
 
         # ── 3 · Skip-row patterns ─────────────────────────────────────────────
-        sk_lf = ttk.LabelFrame(parent, text="3 · Skip Row Patterns  (regex, one per line)")
-        sk_lf.pack(fill=tk.X, padx=4, pady=4)
-        self._skip_text = tk.Text(sk_lf, height=5, font=("Consolas", 9), wrap=tk.NONE)
-        self._skip_text.pack(fill=tk.X, padx=6, pady=4)
+        sk_lf = ttk.LabelFrame(parent, text="3 · Skip Row Patterns (regex, one per line)")
+        sk_lf.grid(row=2, column=0, sticky="ew", padx=4, pady=4)
+        sk_lf.columnconfigure(0, weight=1)
+        
+        self._skip_text = tk.Text(sk_lf, height=5, font=("Consolas", 9), wrap=tk.WORD)
+        self._skip_text.grid(row=0, column=0, sticky="ew", padx=6, pady=4)
         self._skip_text.insert("1.0", DEFAULT_SKIP)
 
         # ── 4 · Extraction settings ───────────────────────────────────────────
         es_lf = ttk.LabelFrame(parent, text="4 · Extraction Settings")
-        es_lf.pack(fill=tk.X, padx=4, pady=4)
+        es_lf.grid(row=3, column=0, sticky="ew", padx=4, pady=4)
+        es_lf.columnconfigure(0, weight=1)
+        
         g = ttk.Frame(es_lf)
-        g.pack(fill=tk.X, padx=6, pady=4)
+        g.grid(row=0, column=0, sticky="ew", padx=6, pady=4)
+        g.columnconfigure(0, weight=0)
+        g.columnconfigure(1, weight=1)
 
         settings_rows = [
             ("Skip first N rows / page:",       "_skip_h",   0,  50),
@@ -267,23 +362,23 @@ class App(tk.Tk):
             ("Min % of columns that must match:", "_min_m",  100, 100),
         ]
         for row_idx, (label, attr, default, max_val) in enumerate(settings_rows):
-            ttk.Label(g, text=label, anchor="w", width=35).grid(
+            ttk.Label(g, text=label, anchor="w").grid(
                 row=row_idx, column=0, sticky="w", pady=2
             )
             var = tk.IntVar(value=default)
             setattr(self, attr, var)
-            ttk.Spinbox(g, from_=0, to=max_val, textvariable=var, width=6).grid(
+            ttk.Spinbox(g, from_=0, to=max_val, textvariable=var, width=8).grid(
                 row=row_idx, column=1, padx=8, sticky="w"
             )
 
-        ttk.Label(g, text="Table detection strategy:", anchor="w", width=35).grid(
+        ttk.Label(g, text="Table detection strategy:", anchor="w").grid(
             row=3, column=0, sticky="w", pady=2
         )
         self._strategy = tk.StringVar(value="auto")
         ttk.Combobox(
             g, textvariable=self._strategy,
             values=["auto", "lines", "text"],
-            width=8, state="readonly",
+            width=10, state="readonly",
         ).grid(row=3, column=1, padx=8, sticky="w")
 
         # ── Run button ────────────────────────────────────────────────────────
@@ -291,69 +386,64 @@ class App(tk.Tk):
             parent, text="▶   Extract Data",
             command=self._run_extraction, style="Run.TButton",
         )
-        self._run_btn.pack(fill=tk.X, padx=4, pady=(10, 4))
+        self._run_btn.grid(row=4, column=0, sticky="ew", padx=4, pady=(10, 4))
 
-        # Populate initial column rows
+        # Populate initial column rows (5 columns for PII)
         self._refresh_cols()
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  RIGHT PANEL — progress, log, export
+    #  RIGHT PANEL — progress, log, export (RESIZABLE)
     # ══════════════════════════════════════════════════════════════════════════
 
     def _build_right(self, parent: tk.Widget) -> None:
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(1, weight=1)  # Log expands
+        parent.rowconfigure(2, weight=0)  # Summary
+        parent.rowconfigure(3, weight=0)  # Export
 
         # ── Progress bar ──────────────────────────────────────────────────────
         pf = ttk.LabelFrame(parent, text="Progress")
-        pf.pack(fill=tk.X, padx=4, pady=4)
+        pf.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
+        pf.columnconfigure(0, weight=1)
+        
         self._prog = tk.DoubleVar()
         ttk.Progressbar(
-            pf, variable=self._prog, maximum=100, length=500
-        ).pack(fill=tk.X, padx=6, pady=(6, 2))
+            pf, variable=self._prog, maximum=100
+        ).grid(row=0, column=0, sticky="ew", padx=6, pady=(6, 2))
+        
         self._prog_lbl = ttk.Label(pf, text="Ready.", foreground="#555")
-        self._prog_lbl.pack(padx=6, pady=(0, 6), anchor="w")
+        self._prog_lbl.grid(row=1, column=0, sticky="w", padx=6, pady=(0, 6))
 
-        # ── Log / errors ──────────────────────────────────────────────────────
+        # ── Log / errors (EXPANDS) ──────────────────────────────────────────
         lf = ttk.LabelFrame(parent, text="Log / Errors")
-        lf.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        lf.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        lf.columnconfigure(0, weight=1)
+        lf.rowconfigure(1, weight=1)
 
         tb = ttk.Frame(lf)
-        tb.pack(fill=tk.X, padx=4, pady=2)
-        ttk.Button(tb, text="Clear Log", command=self._clear_log, width=10).pack(
-            side=tk.RIGHT
+        tb.grid(row=0, column=0, sticky="ew", padx=4, pady=2)
+        tb.columnconfigure(0, weight=1)
+        
+        ttk.Button(tb, text="Clear Log", command=self._clear_log, width=10).grid(
+            row=0, column=4, padx=(0, 4)
         )
-        ttk.Label(
-            tb,
-            text="  ■ INFO   ",
-            foreground="#111",
-            font=("Segoe UI", 8),
-        ).pack(side=tk.RIGHT)
-        ttk.Label(
-            tb,
-            text="  ■ SUCCESS   ",
-            foreground="#1e8449",
-            font=("Segoe UI", 8),
-        ).pack(side=tk.RIGHT)
-        ttk.Label(
-            tb,
-            text="  ■ WARN   ",
-            foreground="#ca6f1e",
-            font=("Segoe UI", 8),
-        ).pack(side=tk.RIGHT)
-        ttk.Label(
-            tb,
-            text="  ■ ERROR",
-            foreground="#c0392b",
-            font=("Segoe UI", 8),
-        ).pack(side=tk.RIGHT)
+        
+        # Legend
+        legend_frame = ttk.Frame(tb)
+        legend_frame.grid(row=0, column=0, sticky="w")
+        
+        for color, text in [("#111", "INFO"), ("#1e8449", "SUCCESS"), 
+                            ("#ca6f1e", "WARN"), ("#c0392b", "ERROR")]:
+            ttk.Label(legend_frame, text=f"■ {text}  ", foreground=color, 
+                     font=("Segoe UI", 8)).pack(side=tk.LEFT)
 
         self._log_widget = scrolledtext.ScrolledText(
             lf,
             state="disabled",
             font=("Consolas", 9),
-            height=18,
             wrap=tk.WORD,
         )
-        self._log_widget.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+        self._log_widget.grid(row=1, column=0, sticky="nsew", padx=4, pady=(0, 4))
         self._log_widget.tag_config("INFO",    foreground="#111111")
         self._log_widget.tag_config("ERROR",   foreground="#c0392b")
         self._log_widget.tag_config("SUCCESS", foreground="#1e8449")
@@ -361,18 +451,21 @@ class App(tk.Tk):
 
         # ── Results summary ───────────────────────────────────────────────────
         sf = ttk.LabelFrame(parent, text="Results Summary")
-        sf.pack(fill=tk.X, padx=4, pady=4)
+        sf.grid(row=2, column=0, sticky="ew", padx=4, pady=4)
+        
         self._summary_lbl = ttk.Label(
             sf, text="No extraction run yet.", foreground="#888"
         )
-        self._summary_lbl.pack(padx=6, pady=6, anchor="w")
+        self._summary_lbl.grid(row=0, column=0, sticky="w", padx=6, pady=6)
 
-        # ── Export ────────────────────────────────────────────────────────────
+        # ── Export (stays at bottom) ──────────────────────────────────────────
         ef = ttk.LabelFrame(parent, text="Export")
-        ef.pack(fill=tk.X, padx=4, pady=4)
+        ef.grid(row=3, column=0, sticky="ew", padx=4, pady=4)
+        ef.columnconfigure(0, weight=1)
 
         fmt_row = ttk.Frame(ef)
-        fmt_row.pack(fill=tk.X, padx=6, pady=(6, 2))
+        fmt_row.grid(row=0, column=0, sticky="w", padx=6, pady=(6, 2))
+        
         ttk.Label(fmt_row, text="Clean data format:").pack(side=tk.LEFT, padx=(0, 8))
         self._fmt = tk.StringVar(value="Excel (.xlsx)")
         for fmt in EXPORT_FMTS:
@@ -381,15 +474,18 @@ class App(tk.Tk):
             ).pack(side=tk.LEFT, padx=4)
 
         btn_row = ttk.Frame(ef)
-        btn_row.pack(fill=tk.X, padx=6, pady=(4, 8))
+        btn_row.grid(row=1, column=0, sticky="ew", padx=6, pady=(4, 8))
+        
         ttk.Button(
             btn_row, text="💾  Export Clean Data",
             command=self._export_clean, style="Action.TButton",
         ).pack(side=tk.LEFT, padx=(0, 6))
+        
         ttk.Button(
             btn_row, text="🗑  Export Removed Rows (.xlsx)",
             command=self._export_removed, style="Action.TButton",
         ).pack(side=tk.LEFT, padx=(0, 6))
+        
         ttk.Button(
             btn_row, text="📦  Export Both to Folder…",
             command=self._export_all, style="Action.TButton",
@@ -398,6 +494,38 @@ class App(tk.Tk):
     # ══════════════════════════════════════════════════════════════════════════
     #  Column row management
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _insert_preset_pattern(self, name: str) -> None:
+        """Insert a preset regex pattern into the first column-pattern box."""
+        if not self._col_rows:
+            self._logmsg("Create at least one column row before inserting a pattern.", "WARN")
+            return
+
+        pattern = PRESET_REGEX_PATTERNS.get(name, "")
+        if not pattern:
+            self._logmsg(f"No preset pattern found for '{name}'.", "WARN")
+            return
+
+        # Special handling for PII Complete pattern
+        if name == "PII Complete (5 cols)":
+            # Set number of columns to 5
+            self._ncols.set(5)
+            self._refresh_cols()
+            
+            # Set column names
+            for i, col_name in enumerate(PII_COLUMN_NAMES):
+                if i < len(self._col_rows):
+                    self._col_rows[i].name_var.set(col_name)
+            
+            # Set pattern in first row (will be applied to all rows through validation)
+            self._col_rows[0].pattern_var.set(pattern)
+            self._logmsg(
+                f"Applied PII Complete pattern with columns: {', '.join(PII_COLUMN_NAMES)}", 
+                "SUCCESS"
+            )
+        else:
+            self._col_rows[0].pattern_var.set(pattern)
+            self._logmsg(f"Inserted preset pattern into the first regex box: {name}.", "SUCCESS")
 
     def _refresh_cols(self) -> None:
         try:
@@ -412,16 +540,24 @@ class App(tk.Tk):
             w.destroy()
         self._col_rows.clear()
 
+        # Configure inner frame columns for proper expansion
+        self._col_inner.columnconfigure(0, weight=1)
+        
         for i in range(1, n + 1):
             row = ColumnRow(self._col_inner, index=i)
-            row.pack(fill=tk.X, pady=1)
+            row.pack(fill=tk.X, expand=True, pady=1)
+            
+            # Restore saved values if available
             if i - 1 < len(saved):
                 row.name_var.set(saved[i - 1][0] or f"Column{i}")
                 row.pattern_var.set(saved[i - 1][1])
             self._col_rows.append(row)
+        
+        # Update canvas scroll region
+        self._col_canvas.configure(scrollregion=self._col_canvas.bbox("all"))
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  Source selection
+    #  Source selection (unchanged but included for completeness)
     # ══════════════════════════════════════════════════════════════════════════
 
     def _pick_files(self) -> None:
@@ -465,7 +601,7 @@ class App(tk.Tk):
             self._logmsg("No PDF files found in the selected folder.", "WARN")
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  Extraction
+    #  Extraction (unchanged)
     # ══════════════════════════════════════════════════════════════════════════
 
     def _build_config(self) -> ExtractionConfig:
@@ -562,7 +698,7 @@ class App(tk.Tk):
         self._run_btn.config(state="normal")
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  Log helpers
+    #  Log helpers (unchanged)
     # ══════════════════════════════════════════════════════════════════════════
 
     def _logmsg(self, msg: str, level: str = "INFO") -> None:
@@ -574,161 +710,7 @@ class App(tk.Tk):
         self._log_widget.config(state="disabled")
 
     def _clear_log(self) -> None:
-        self._log_widget.config(state="normal")
-        self._log_widget.delete("1.0", "end")
-        self._log_widget.config(state="disabled")
-
-    def _set_prog(self, pct: float) -> None:
-        self._prog.set(pct)
-        self._prog_lbl.config(text=f"Processing…  {pct:.0f}%")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    #  Export
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _check_data(self) -> bool:
-        if self.clean_df is None:
-            messagebox.showwarning("No Data", "Run an extraction first.")
-            return False
-        return True
-
-    def _export_clean(self) -> None:
-        if not self._check_data():
-            return
-        fmt  = self._fmt.get()
-        ext  = EXT_MAP[fmt]
-        path = filedialog.asksaveasfilename(
-            defaultextension=ext,
-            filetypes=FT_MAP[fmt],
-            initialfile=f"clean_data{ext}",
-            title="Save Clean Data",
-        )
-        if path:
-            self._write_df(self.clean_df, path, fmt)
-            self._logmsg(f"Clean data saved  →  {path}", "SUCCESS")
-
-    def _export_removed(self) -> None:
-        if not self._check_data():
-            return
-        if self.removed_df is None or self.removed_df.empty:
-            messagebox.showinfo("Nothing to Export", "No removed rows were recorded.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".xlsx",
-            filetypes=[("Excel workbook", "*.xlsx")],
-            initialfile="removed_data.xlsx",
-            title="Save Removed Rows",
-        )
-        if path:
-            self.removed_df.to_excel(path, index=False)
-            self._logmsg(f"Removed rows saved  →  {path}", "SUCCESS")
-
-    def _export_all(self) -> None:
-        if not self._check_data():
-            return
-        folder = filedialog.askdirectory(title="Select Output Folder")
-        if not folder:
-            return
-
-        ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fmt = self._fmt.get()
-        ext = EXT_MAP[fmt]
-
-        clean_path   = os.path.join(folder, f"clean_data_{ts}{ext}")
-        removed_path = os.path.join(folder, f"removed_data_{ts}.xlsx")
-
-        self._write_df(self.clean_df, clean_path, fmt)
-        self._logmsg(f"Clean data saved    →  {clean_path}", "SUCCESS")
-
-        if self.removed_df is not None and not self.removed_df.empty:
-            self.removed_df.to_excel(removed_path, index=False)
-            self._logmsg(f"Removed data saved  →  {removed_path}", "SUCCESS")
-        else:
-            self._logmsg("No removed rows to export.", "WARN")
-
-        messagebox.showinfo("Export Complete", f"Files saved to:\n{folder}")
-
-    @staticmethod
-    def _write_df(df: pd.DataFrame, path: str, fmt: str) -> None:
-        if "Excel" in fmt:
-            df.to_excel(path, index=False)
-        elif "CSV" in fmt:
-            df.to_csv(path, index=False)
-        elif "JSON" in fmt:
-            df.to_json(path, orient="records", indent=2)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    #  Config persistence
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _save_config(self) -> None:
-        path = filedialog.asksaveasfilename(
-            defaultextension=".json",
-            filetypes=[("JSON config", "*.json")],
-            initialfile="extractor_config.json",
-            title="Save Configuration",
-        )
-        if not path:
-            return
-        cfg = {
-            "n_cols":           self._ncols.get(),
-            "columns":          [{"name": r.name, "pattern": r.pattern} for r in self._col_rows],
-            "skip_patterns":    self._skip_text.get("1.0", "end").strip(),
-            "skip_header_rows": self._skip_h.get(),
-            "skip_footer_rows": self._skip_f.get(),
-            "min_match_pct":    self._min_m.get(),
-            "table_strategy":   self._strategy.get(),
-        }
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(cfg, fh, indent=2)
-        self._logmsg(f"Config saved  →  {path}", "SUCCESS")
-
-    def _load_config(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Load Configuration",
-            filetypes=[("JSON config", "*.json")],
-        )
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as fh:
-                cfg = json.load(fh)
-        except Exception as exc:
-            messagebox.showerror("Load Error", f"Could not read config:\n{exc}")
-            return
-
-        self._ncols.set(cfg.get("n_cols", 3))
-        self._refresh_cols()
-
-        for i, col in enumerate(cfg.get("columns", [])):
-            if i < len(self._col_rows):
-                self._col_rows[i].name_var.set(col.get("name", f"Column{i + 1}"))
-                self._col_rows[i].pattern_var.set(col.get("pattern", ""))
-
-        self._skip_text.delete("1.0", "end")
-        self._skip_text.insert("1.0", cfg.get("skip_patterns", ""))
-        self._skip_h.set(cfg.get("skip_header_rows", 0))
-        self._skip_f.set(cfg.get("skip_footer_rows", 0))
-        self._min_m.set(cfg.get("min_match_pct", 100))
-        self._strategy.set(cfg.get("table_strategy", "auto"))
-
-        self._logmsg(f"Config loaded  ←  {path}", "SUCCESS")
-
-    # ── About ─────────────────────────────────────────────────────────────────
-
-    def _show_about(self) -> None:
-        messagebox.showinfo(
-            "About",
-            f"{APP_TITLE}  v{APP_VERSION}\n\n"
-            "Extract structured tabular data from PDF files.\n\n"
-            "Files:\n"
-            "  gui.py          — this GUI\n"
-            "  pdf_extractor.py — extraction engine\n\n"
-            "Dependencies:\n"
-            "  pdfplumber, pandas, openpyxl\n\n"
-            "Tip: use File → Save Configuration to reuse\n"
-            "your column and pattern settings.",
-        )
+        self._
 
 
 # ══════════════════════════════════════════════════════════════════════════════
