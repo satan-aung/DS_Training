@@ -1,9 +1,21 @@
+import camelot
 import pandas as pd
-import pdfplumber
+# import pdfplumber
 import xml.etree.ElementTree as ET
 import re
 import os
 from pathlib import Path
+
+def is_layout_garbage(line_text):
+    """Identifies and eliminates system layout noise from diagnostic outputs."""
+    clean = line_text.strip()
+    if not clean or clean == "\x0c":
+        return True
+    if any(kwd in clean for kwd in ["APEX GLOBAL", "AUDIT DIVISION", "DATA DUMP", "---", "===", "RUN DATE:", "CONFIDENTIAL RECORD", "CONFIDENTIAL - INTEERNAL", "PAGE"]):
+        return True
+    if re.match(r'^[-_=+]+$', clean):
+        return True
+    return False
 
 def detect_pii(df):
     pii_patterns = {
@@ -101,46 +113,88 @@ def read_csv(path: str, sep: str | None = None, encoding: str = "utf-8") -> pd.D
 # 3. PDF  (.pdf)  — table extraction
 # ─────────────────────────────────────────────
 
+# def read_pdf(path: str, pages: str = "all") -> pd.DataFrame:
+#     """
+#     Extracts tables from a PDF using pdfplumber.
+#     Merges all tables found across the requested pages.
+#     Falls back to raw text parsing if no tables are detected.
+#     """
+#     all_tables = []
+
+#     with pdfplumber.open(path) as pdf:
+#         page_range = pdf.pages if pages == "all" else [pdf.pages[p] for p in pages]
+
+#         for page in page_range:
+#             tables = page.extract_tables()
+#             for table in tables:
+#                 if table:
+#                     df = pd.DataFrame(table[1:], columns=table[0])  # first row = header
+#                     all_tables.append(df)
+#                     all_tables['Doc ID'] = path.name
+#                     all_tables['Source'] = f"Page {page.page_number}"
+
+#     if all_tables:
+#         combined = pd.concat(all_tables, ignore_index=True)
+#         print(f"[PDF]   {combined.shape[0]} rows × {combined.shape[1]} cols  |  {len(all_tables)} table(s) found")
+#         return combined
+
+#     # ── Fallback: no tables found → extract raw text into a single-column DF ──
+#     print("[PDF]   No tables detected — falling back to raw text extraction")
+#     lines = []
+#     header_keywords = []    # simple heuristic for header detection
+#     with pdfplumber.open(path) as pdf:
+#         for page in pdf.pages:
+#             text = page.extract_text()
+#             if text:
+#                 for line in text.splitlines():
+#                     if any(kwd in line for kwd in ["FULL NAME"]):
+#                         if line.strip() not in header_keywords:
+#                             header_keywords.append(line.strip())
+#                         continue
+#                     if is_layout_garbage(line):
+#                         continue  # skip lines that are likely layout noise
+
+#                     if line.strip():
+#                         lines.append({"text": line, "Doc ID": path.name, "Source": f"Page {page.page_number}"})
+#                         print(f"[PDF]   Extracted line: {line.strip()[:50]}...")
+#     df = pd.DataFrame(lines, columns=header_keywords + ["Doc ID", "Source"])
+#     print(f"Header keywords detected: {header_keywords}")
+#     print(f"[PDF]   Extracted {df.shape[0]} lines of text into DataFrame")
+#     print(f"First 5 rows after PII detection:\n{df.head()}")
+#     return df
+
 def read_pdf(path: str, pages: str = "all") -> pd.DataFrame:
-    """
-    Extracts tables from a PDF using pdfplumber.
-    Merges all tables found across the requested pages.
-    Falls back to raw text parsing if no tables are detected.
-    """
-    all_tables = []
+    """Extracts tables from a PDF using Camelot. 
+    flavor='lattice' for bordered tables, 'stream' for whitespace-separated """
+    tables = camelot.read_pdf(path, pages=pages, flavor='stream')
+    
+    dfs = []
+    for table in tables:
+        df = table.df.copy()
+        for row in df.itertuples():
+            if "FULL NAME" in row:
+                df.columns = df.iloc[row.Index]  # promote this row to header
+            if any(is_layout_garbage(str(cell)) for cell in row):
+                df.drop(row.Index, inplace=True)
+        df['Source'] = f"Page {table.page}"
+        df['Doc ID'] = Path(path).name
+        df = df.reset_index(drop=True)  # reset index after dropping rows
+        dfs.append(df)
 
-    with pdfplumber.open(path) as pdf:
-        page_range = pdf.pages if pages == "all" else [pdf.pages[p] for p in pages]
+    df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=['Doc ID', 'Source'])
+    print(f"[PDF]   {df.shape[0]} rows × {df.shape[1]} cols  |  {len(tables)} table(s) found with Camelot")
+    df_result = detect_pii(df)
 
-        for page in page_range:
-            tables = page.extract_tables()
-            for table in tables:
-                if table:
-                    df = pd.DataFrame(table[1:], columns=table[0])  # first row = header
-                    all_tables.append(df)
-                    all_tables['Doc ID'] = path.name
-                    all_tables['Source'] = f"Page {page.page_number}"
-
-    if all_tables:
-        combined = pd.concat(all_tables, ignore_index=True)
-        print(f"[PDF]   {combined.shape[0]} rows × {combined.shape[1]} cols  |  {len(all_tables)} table(s) found")
-        return combined
-
-    # ── Fallback: no tables found → extract raw text into a single-column DF ──
-    print("[PDF]   No tables detected — falling back to raw text extraction")
-    lines = []
-    with pdfplumber.open(path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                for line in text.splitlines():
-                    if line.strip():
-                        lines.append({"text": line, "Doc ID": path.name})
-                        lines.append({"text": line, "Source": f"Page {page.page_number}"})
-
-    df_data = pd.DataFrame(lines)
-    print(f"[PDF]   Extracted {df_data.shape[0]} lines of text into DataFrame")
-    return df_data
+    # df = pd.concat([t.df for t in tables], ignore_index=True)
+    # for row in df.itertuples():
+    #     if any(is_layout_garbage(str(cell)) for cell in row):
+    #         df.drop(row.Index, inplace=True)
+    #     df['Source'] = f"Page {tables[0].page}"  # crude page assignment based on row index
+    # df.columns = df.iloc[0].str.lower()     # promote first row to header
+    # df = df[1:].reset_index(drop=True)     # drop the original header row
+    # df_result = detect_pii(df)
+    # df_result['Doc ID'] = Path(path).name
+    return df_result
 
 # ─────────────────────────────────────────────
 # 4. XML  (.xml)
